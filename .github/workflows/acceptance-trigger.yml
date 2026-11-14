@@ -1,0 +1,353 @@
+# PXL Classroom - broker acceptance handler.
+#
+# SECURITY MODEL:
+# This workflow lives on a PUBLIC broker repo's default branch (one per assignment).
+# Acceptance is triggered by a public event on a public repository, so anyone can
+# ring the doorbell. What stops an outsider from causing work is the SIGNED
+# INVITATION TOKEN in the issue title: it is verified here, from a checkout of the
+# public hub, BEFORE any credential is in scope. A caller without a valid token
+# costs one boot on a free public runner - no App token minted, no hub run, no
+# clone of the private control repo.
+#
+# The verifier is public, which is why the signature is asymmetric. Only the
+# PUBLIC key is readable here (hub: acceptance/invite-keys.json); the signing key
+# never leaves the hub. See ARCHITECTURE §4.3.2 and lib/invite-token.mjs.
+#
+# NO ATTACKER-CONTROLLED TEXT MAY REACH A SHELL HERE. This repository carries a
+# credential and any GitHub account can open an issue on it, so an issue body
+# interpolated into `run:` is code execution beside that credential. Every value
+# below is passed through `env:` - never `${{ }}` inside a script - and the issue
+# BODY is never read here at all: the hub fetches and validates it
+# (scripts/read-team-payload.mjs). See ARCHITECTURE §4.3.1.
+#
+# The rule has not softened now that the credential is the narrow broker App
+# rather than the provisioning App's key. It is still a credential on a public
+# repository, and the rule is about what may reach a shell - not about how much
+# the thing in scope is worth.
+#
+# Secrets required:
+#   PXL_BROKER_CLIENT_ID   - BROKER App Client ID (Iv… string)
+#   PXL_BROKER_PRIVATE_KEY - BROKER App private key (PEM)
+#
+# THE BROKER APP IS NOT THE PROVISIONING APP, and the distinction is the whole
+# point. This repository is PUBLIC, there is one per assignment, and it used to
+# hold PXL_APP_PRIVATE_KEY - the provisioning App's own key. Measured
+# 2026-08-31, that key was on 11 public repositories across 8 organizations, and
+# it mints tokens carrying administration=write, organization_administration=
+# write, members=write, secrets=write, workflows=write and contents=write on
+# every org the App is installed on. Anyone with admin on one course org could
+# push a workflow here and read it out, which made a lecturer scoped to one
+# course an administrator of all twelve.
+#
+# The broker App is installed on the HUB REPOSITORY ALONE and holds Contents:
+# write alone - exactly what POST /repos/{o}/{r}/dispatches requires and nothing
+# else. If this key leaks, what it buys is the ability to submit an acceptance
+# to the hub, which the signature check below already bounds. It has no
+# `actions: write`, so it cannot dispatch a hub workflow either.
+#
+# Scoping the minted TOKEN (`owner:` + `repositories:` + `permission-contents:`)
+# is defence in depth. The secret is the thing that is stored, and narrowing
+# THAT is what actually reduced the blast radius.
+#
+# Variables required (all set by publish-assignment.yml):
+#   ASSIGNMENT_ID          - the assignment this broker accepts for
+#   CONTROL_ORG            - e.g. "PXLAutomation" (the org owning the control repo)
+#   INVITE_NONCE           - current invitation generation; rotating it retires
+#                            every link issued before it
+#   INVITE_PUBKEY          - the assignment's acceptance PUBLIC key (P-256, SPKI,
+#                            base64url). Public by design. The student signs with
+#                            the private half, which lives only in their link, so
+#                            the title carries a signature rather than a
+#                            credential - see ARCHITECTURE §4.3.2. Absent means
+#                            reject, never "accept anything"
+#   INVITE_ENABLED         - "false" turns acceptance off without deleting anything
+
+name: Acceptance trigger
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: read
+  issues: write
+
+# NO CONCURRENCY GROUP. One per accepting account used to live here. GitHub
+# keeps ONE pending run per group and cancels it for the next arrival, and a run
+# that never gets a runner holds the group for up to a day - so a student whose
+# first attempt was stuck could not get a second one past this point. Nothing
+# here needs serialising: every step acts on its own issue, and the hub orders a
+# student's attempts by issue number (lib/acceptance-reservation.mjs).
+
+jobs:
+  dispatch:
+    # Evaluated BEFORE a runner is allocated. An issue that is not an acceptance
+    # attempt, or an assignment whose invitations are switched off, is skipped
+    # without consuming a runner at all.
+    # `pxl-confirm:` is the SAME link asking a smaller question: bind this
+    # account to an institutional address, and nothing else - no repository, no
+    # roster gate, no deadline. It rides this broker on purpose, so it inherits
+    # the kill switch on the line below and the nonce rotation that retires
+    # every link at once, instead of having a lifetime of its own that nobody
+    # would remember to end. The purpose is inside the signature, not just this
+    # prefix - see lib/acceptance-signature.mjs.
+    if: >-
+      github.event.action == 'opened'
+      && (startsWith(github.event.issue.title, 'pxl-accept:')
+          || startsWith(github.event.issue.title, 'pxl-confirm:'))
+      && vars.INVITE_ENABLED != 'false'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate actor
+        id: validate
+        shell: bash
+        env:
+          # THE ISSUE'S AUTHOR, not `github.actor` and not `sender`.
+          #
+          # The signature is verified against `issue.user.id`, so provisioning
+          # for anyone else would mean the account we checked and the account we
+          # act for are two different facts read from two different fields. For
+          # a freshly opened issue they agree, which is exactly why a divergence
+          # would be invisible until it was not - an issue opened through an App
+          # on a user's behalf reports the App as `sender` and the user as
+          # `issue.user`.
+          ACTOR: ${{ github.event.issue.user.login }}
+          ACTOR_ID: ${{ github.event.issue.user.id }}
+        run: |
+          [[ -n "$ACTOR" && -n "$ACTOR_ID" ]] \
+            || { echo "::error::Missing actor"; exit 1; }
+          [[ "$ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] \
+            || { echo "::error::Actor is not a valid GitHub login"; exit 1; }
+          [[ "$ACTOR_ID" =~ ^[0-9]+$ ]] \
+            || { echo "::error::Actor id is not numeric"; exit 1; }
+          {
+            echo "actor=$ACTOR"
+            echo "actor_id=$ACTOR_ID"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Parse invitation title
+        id: parse
+        shell: bash
+        env:
+          # Read through env, never interpolated into this script. A bash regex
+          # match against an env var cannot break out the way a substituted
+          # `${{ }}` value can.
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          HINT=""
+          NUMBER=""
+          # Only the TEAM HINT is parsed here. The title itself is handed to the
+          # verifier untouched, because deciding which invitation format a title
+          # is belongs in one place, in JS - a bash regex that matched only the
+          # new shape would make an out-of-date link fail to match at all, and
+          # the student would be told their link was malformed rather than old.
+          RE='^pxl-accept:[A-Za-z0-9_.-]+( team:([a-z0-9][a-z0-9-]{0,63}))?$'
+          if [[ "$ISSUE_TITLE" =~ $RE ]]; then
+            HINT="${BASH_REMATCH[2]}"
+          fi
+          if [[ "$ISSUE_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            NUMBER="$ISSUE_NUMBER"
+          fi
+          {
+            echo "team_hint=$HINT"
+            echo "number=$NUMBER"
+          } >> "$GITHUB_OUTPUT"
+
+      # Public repository, no credentials. This is the only third-party action
+      # in the pre-verification path, and the runner's own Node runs the
+      # verifier - lib/invite-token.mjs is Node-builtin-only precisely so that
+      # no `npm ci` is needed on a credential-bearing public repository.
+      - name: Check out the hub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: PXL-Digital-Application-Samples/pxl-classroom
+          ref: main
+          path: hub
+          persist-credentials: false
+
+      - name: Verify invitation token
+        id: verify
+        shell: bash
+        env:
+          # The title carries a SIGNATURE, not a credential. Read through env,
+          # never interpolated into a script.
+          TITLE: ${{ github.event.issue.title }}
+          INVITE_PUBKEY: ${{ vars.INVITE_PUBKEY }}
+          # The anti-replay check: the signature names the account that made it,
+          # and anyone replaying it out of the public archive is authoring the
+          # issue as themselves, so the two disagree. GitHub sets this; it is
+          # not student-supplied.
+          ISSUE_AUTHOR_ID: ${{ github.event.issue.user.id }}
+          ORG: ${{ vars.CONTROL_ORG }}
+          ASSIGNMENT_ID: ${{ vars.ASSIGNMENT_ID }}
+          INVITE_NONCE: ${{ vars.INVITE_NONCE }}
+          KEYS_FILE: hub/acceptance/invite-keys.json
+        run: node hub/scripts/verify-invite-token.mjs
+
+      - name: Reject invalid invitation
+        if: steps.verify.outputs.valid != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          REASON: ${{ steps.verify.outputs.reason }}
+          # lib/github-api-version.mjs, which YAML cannot import; the test
+          # tests/github-api-version.test.mjs holds this equal to it.
+          GITHUB_API_VERSION: "2026-03-10"
+        run: |
+          echo "::notice::Invitation rejected (${REASON}) - no credential was used"
+          [ -n "$ISSUE_NUMBER" ] || exit 0
+          ISSUE="repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}"
+          # Redact first. A rejection is usually a forged or retired token, but
+          # `wrong-assignment` means a LIVE token for a different assignment was
+          # posted here - and this repository is public. Renaming costs no
+          # credential, so the §4.3.2 floor (a bad token reaches nothing
+          # privileged) still holds.
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f title="Acceptance attempt (rejected)" >/dev/null || true
+          # Deliberately generic: the precise reason stays in this run's log
+          # rather than becoming a probing oracle on a public repository.
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method POST "$ISSUE/comments" \
+            -f body="This invitation link is not valid for this assignment, or is no longer current. Ask your lecturer for an up-to-date link." >/dev/null || true
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f state=closed -f state_reason=not_planned >/dev/null || true
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PUT "$ISSUE/lock" -f lock_reason=resolved >/dev/null || true
+
+      - name: Mint dispatcher token
+        if: steps.verify.outputs.valid == 'true'
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.PXL_BROKER_CLIENT_ID }}
+          private-key: ${{ secrets.PXL_BROKER_PRIVATE_KEY }}
+          owner: PXL-Digital-Application-Samples
+          repositories: pxl-classroom
+          # The single permission a repository_dispatch needs. Stated explicitly
+          # so the token stays minimal even if the broker App is ever widened.
+          permission-contents: write
+
+      - name: Dispatch to central pxl-classroom
+        id: dispatch
+        if: steps.verify.outputs.valid == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          CONTROL_ORG: ${{ vars.CONTROL_ORG }}
+          ASSIGNMENT_ID: ${{ vars.ASSIGNMENT_ID }}
+          ACTOR: ${{ steps.validate.outputs.actor }}
+          ACTOR_ID: ${{ steps.validate.outputs.actor_id }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          TEAM_HINT: ${{ steps.parse.outputs.team_hint }}
+          BROKER_REPO: ${{ github.repository }}
+          # From the VERIFIER, which checked a signature covering it - never
+          # re-read off the title here. Empty from an older verifier, and the
+          # hub reads an absent kind as `accept`, which is what every dispatch
+          # before this change meant.
+          KIND: ${{ steps.verify.outputs.kind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # lib/github-api-version.mjs, which YAML cannot import; the test
+          # tests/github-api-version.test.mjs holds this equal to it.
+          GITHUB_API_VERSION: "2026-03-10"
+        run: |
+          ARGS=(
+            "/repos/PXL-Digital-Application-Samples/pxl-classroom/dispatches"
+            -f "event_type=acceptance"
+            -f "client_payload[org]=$CONTROL_ORG"
+            -f "client_payload[assignment_id]=$ASSIGNMENT_ID"
+            -f "client_payload[github_login]=$ACTOR"
+            -f "client_payload[github_id]=$ACTOR_ID"
+            -f "client_payload[broker_repo]=$BROKER_REPO"
+            -f "client_payload[workflow_run_url]=$RUN_URL"
+          )
+          if [ -n "$ISSUE_NUMBER" ]; then
+            ARGS+=(-f "client_payload[issue_number]=$ISSUE_NUMBER")
+          fi
+          if [ -n "$TEAM_HINT" ]; then
+            ARGS+=(-f "client_payload[team_hint]=$TEAM_HINT")
+          fi
+          if [ -n "$KIND" ]; then
+            ARGS+=(-f "client_payload[kind]=$KIND")
+          fi
+          # RETRIED, because a GitHub error here is the whole attempt lost: the
+          # issue would be retitled and the student's page would wait for an
+          # answer that is not coming. Five tries over about a minute and a
+          # quarter rides out a short incident; past that the next step titles
+          # the issue "(not delivered)" so the page can say so at once.
+          # Delivering twice is harmless - the hub decides a student's attempt
+          # idempotently.
+          for WAIT in 5 10 20 40 0; do
+            if gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method POST "${ARGS[@]}"; then
+              exit 0
+            fi
+            [ "$WAIT" -gt 0 ] || break
+            echo "Dispatch failed; trying again in ${WAIT}s."
+            sleep "$WAIT"
+          done
+          echo "::error::Could not hand this acceptance to the hub."
+          exit 1
+
+      # The trigger issue's TITLE carries the assignment's signed invitation, and
+      # this repository is public. Closing and locking hide nothing - a locked,
+      # closed issue on a public repo is still readable, still listed, and still
+      # returned by GitHub's issue search - so the first student to accept used
+      # to publish the assignment's token to anyone who looked. That collapses
+      # both §4.3.2 (an outsider who never had the link cannot trigger work) and
+      # §4.3.3 (the acceptance card is named sha256(token), so a public token is
+      # a public card, teams file included).
+      #
+      # Redacting the TITLE is what this step can do, and it does it in seconds.
+      # Deleting the issue outright needs ADMIN on the repository, which
+      # `github.token` never has - so the hub does that, after it has read the
+      # group payload out of the body. Deleting here would race that read and
+      # break every group acceptance.
+      #
+      # Renaming an issue needs only `issues: write`, so this costs no
+      # extra credential on a repository that already holds too many.
+      - name: Redact and lock trigger issue
+        if: always() && steps.verify.outputs.valid == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.parse.outputs.number }}
+          # Only to name what happened. The redaction itself does not depend on
+          # it, so an empty kind still rewrites the title.
+          KIND: ${{ steps.verify.outputs.kind }}
+          # `success`, `failure` or `skipped` (the token could not be minted).
+          DELIVERED: ${{ steps.dispatch.outcome }}
+          # lib/github-api-version.mjs, which YAML cannot import; the test
+          # tests/github-api-version.test.mjs holds this equal to it.
+          GITHUB_API_VERSION: "2026-03-10"
+        run: |
+          [ -n "$ISSUE_NUMBER" ] || exit 0
+          ISSUE="repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}"
+          # REDACT and LOCK, but do NOT close.
+          #
+          # The student authored this issue, so GitHub subscribes them to it -
+          # and closing is a state change, which emails them. A student
+          # reported receiving "Re: [org/broker-x] Acceptance (processed) -
+          # Closed #1 has been completed", which is mail about internal
+          # plumbing they never asked for and which reads like a failure.
+          #
+          # Editing the title does NOT notify - the same student got exactly
+          # one email, about the close, while this line had already rewritten
+          # their title. So redaction still happens the moment it can, which is
+          # what actually protects the signed invitation (ARCHITECTURE §4.3.2).
+          #
+          # Locking is silent too, and still worth doing: it keeps the issue
+          # from being used as a conversation. Closed vs open changes nothing
+          # else - the hub reads the issue by number, and the page's
+          # "acceptance in flight" check reads `state=all`.
+          #
+          # "(processed)" only when the hub actually has it. A dispatch that
+          # failed every try (or a token that could not be minted) is titled
+          # "(not delivered)", which the student's page reads as "nothing is
+          # coming, try again" instead of waiting minutes for an answer
+          # (frontend/src/lib/acceptance-progress.js). Both spellings are in
+          # lib/broker-issue-titles.mjs, which the tests derive from this file.
+          LABEL="Acceptance"
+          if [ "$KIND" = "confirm" ]; then LABEL="Email confirmation"; fi
+          if [ "$DELIVERED" = "success" ]; then
+            gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f title="$LABEL (processed)" >/dev/null || true
+          else
+            gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PATCH "$ISSUE" -f title="$LABEL (not delivered)" >/dev/null || true
+          fi
+          gh api -H "X-GitHub-Api-Version: ${GITHUB_API_VERSION}" --method PUT "$ISSUE/lock" -f lock_reason=resolved >/dev/null || true
